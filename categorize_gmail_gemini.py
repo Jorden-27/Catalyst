@@ -75,3 +75,12 @@ if __name__ == "__main__":
         print(f"\n📧 Email {idx}")
         print(f"Subject: {email['subject']}")
         print(f"Priority: {priority}")
+
+
+# 🔜 What you can do before moving on
+
+# Store results: Instead of just printing, save classification into a database (SQLite/MongoDB/Postgres). This will make it usable for your dashboard later.
+
+# Error handling: Emails sometimes come with nested parts (MIME structure). Your current code only decodes the top-level body. You may want to extend it to handle "parts" for HTML/text properly.
+
+# Labeling (optional): You could auto-tag emails in Gmail with users().messages().modify() (e.g., add a “High Priority” label).
