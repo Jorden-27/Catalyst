@@ -1,0 +1,11 @@
+# Environment
+.env
+__pycache__/
+*.pyc
+
+# API tokens
+token.json
+credentials.json
+
+# Models
+*.pkl
