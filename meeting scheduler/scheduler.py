@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, time
 from dateutil.parser import isoparse
 import pytz
 import os
+import uuid
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -11,14 +12,17 @@ from googleapiclient.discovery import build
 # -------------------------------
 # CONFIG
 # -------------------------------
-SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
+SCOPES = [
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar.events"
+]
 TIMEZONE = pytz.timezone("Asia/Kolkata")
 
-WORK_START = time(10, 0)   # 10:00 AM
-WORK_END = time(18, 0)     # 6:00 PM
+WORK_START = time(10, 0)
+WORK_END = time(18, 0)
 
 SLOTS_REQUIRED = 3
-SLOT_STEP_MINUTES = 15     # sliding window step
+SLOT_STEP_MINUTES = 15
 
 # -------------------------------
 # AUTHENTICATION
@@ -44,7 +48,7 @@ def get_calendar_service():
     return build("calendar", "v3", credentials=creds)
 
 # -------------------------------
-# FETCH BUSY SLOTS (FIXED)
+# FETCH BUSY SLOTS
 # -------------------------------
 def get_busy_slots(service, start_dt, end_dt):
     body = {
@@ -57,8 +61,7 @@ def get_busy_slots(service, start_dt, end_dt):
     response = service.freebusy().query(body=body).execute()
     busy = response["calendars"]["primary"]["busy"]
 
-    # 🔑 CRITICAL FIX: normalize to local timezone
-    busy_slots = [
+    return [
         (
             isoparse(b["start"]).astimezone(TIMEZONE),
             isoparse(b["end"]).astimezone(TIMEZONE)
@@ -66,41 +69,29 @@ def get_busy_slots(service, start_dt, end_dt):
         for b in busy
     ]
 
-    return busy_slots
-
 # -------------------------------
-# AVAILABILITY ENGINE (CORRECT)
+# AVAILABILITY ENGINE
 # -------------------------------
-def generate_free_slots(
-    busy_slots,
-    start_date,
-    end_date,
-    duration_minutes
-):
+def generate_free_slots(busy_slots, start_date, end_date, duration_minutes):
     free_slots = []
     current_date = start_date
 
     while current_date <= end_date and len(free_slots) < SLOTS_REQUIRED:
         day_start = TIMEZONE.localize(datetime.combine(current_date, WORK_START))
         day_end = TIMEZONE.localize(datetime.combine(current_date, WORK_END))
-    
+
         slot_start = day_start
         while slot_start + timedelta(minutes=duration_minutes) <= day_end:
             slot_end = slot_start + timedelta(minutes=duration_minutes)
 
-            # overlap check
-            overlap = False
-            for busy_start, busy_end in busy_slots:
-                if slot_start < busy_end and slot_end > busy_start:
-                    overlap = True
-                    break
-
-            if not overlap:
+            if not any(
+                slot_start < busy_end and slot_end > busy_start
+                for busy_start, busy_end in busy_slots
+            ):
                 free_slots.append((slot_start, slot_end))
                 if len(free_slots) == SLOTS_REQUIRED:
                     return free_slots
 
-            # move by small step, not duration
             slot_start += timedelta(minutes=SLOT_STEP_MINUTES)
 
         current_date += timedelta(days=1)
@@ -108,53 +99,93 @@ def generate_free_slots(
     return free_slots
 
 # -------------------------------
-# FORMAT OUTPUT
+# FORMAT SLOTS
 # -------------------------------
 def format_slots(slots):
     return [
-        f"{start.strftime('%A, %d %b %Y — %I:%M %p')} "
+        f"{i+1}. {start.strftime('%A, %d %b %Y — %I:%M %p')} "
         f"to {end.strftime('%I:%M %p')} IST"
-        for start, end in slots
+        for i, (start, end) in enumerate(slots)
     ]
+
+# -------------------------------
+# CREATE CALENDAR EVENT (PHASE 2)
+# -------------------------------
+def create_calendar_event(service, start, end, title):
+    event = {
+        "summary": title,
+        "start": {
+            "dateTime": start.isoformat(),
+            "timeZone": TIMEZONE.zone
+        },
+        "end": {
+            "dateTime": end.isoformat(),
+            "timeZone": TIMEZONE.zone
+        },
+        "conferenceData": {
+            "createRequest": {
+                "requestId": str(uuid.uuid4())
+            }
+        }
+    }
+
+    created_event = service.events().insert(
+        calendarId="primary",
+        body=event,
+        conferenceDataVersion=1
+    ).execute()
+
+    return created_event
 
 # -------------------------------
 # MAIN FLOW
 # -------------------------------
-def suggest_meeting_slots(from_date_str, to_date_str, duration_minutes):
+def run_scheduler():
     service = get_calendar_service()
 
-    from_date = datetime.strptime(from_date_str, "%Y-%m-%d").date()
-    to_date = datetime.strptime(to_date_str, "%Y-%m-%d").date()
+    from_date = input("Enter FROM date (YYYY-MM-DD): ")
+    to_date = input("Enter TO date (YYYY-MM-DD): ")
+    duration = int(input("Enter meeting duration (minutes): "))
+    title = input("Enter meeting title: ")
 
-    start_dt = TIMEZONE.localize(datetime.combine(from_date, time.min))
-    end_dt = TIMEZONE.localize(datetime.combine(to_date, time.max))
+    start_date = datetime.strptime(from_date, "%Y-%m-%d").date()
+    end_date = datetime.strptime(to_date, "%Y-%m-%d").date()
+
+    start_dt = TIMEZONE.localize(datetime.combine(start_date, time.min))
+    end_dt = TIMEZONE.localize(datetime.combine(end_date, time.max))
 
     busy_slots = get_busy_slots(service, start_dt, end_dt)
 
-    # 🔍 DEBUG (optional – remove later)
-    print("\nDEBUG: Busy slots from calendar")
-    for bs, be in busy_slots:
-        print("BUSY:", bs.strftime("%H:%M"), "-", be.strftime("%H:%M"))
-
     free_slots = generate_free_slots(
-        busy_slots,
-        from_date,
-        to_date,
-        duration_minutes
+        busy_slots, start_date, end_date, duration
     )
 
-    return format_slots(free_slots)
+    if not free_slots:
+        print("❌ No available slots found.")
+        return
+
+    print("\nAvailable slots:")
+    formatted = format_slots(free_slots)
+    for s in formatted:
+        print(s)
+
+    choice = int(input("\nChoose slot number to confirm: ")) - 1
+    selected_start, selected_end = free_slots[choice]
+
+    event = create_calendar_event(
+        service,
+        selected_start,
+        selected_end,
+        title
+    )
+
+    print("\n✅ Event Created Successfully!")
+    print("📅 Title:", event["summary"])
+    print("🕒 Time:", event["start"]["dateTime"], "-", event["end"]["dateTime"])
+    print("🎥 Google Meet:", event["hangoutLink"])
 
 # -------------------------------
 # RUN
 # -------------------------------
 if __name__ == "__main__":
-    from_date = input("Enter FROM date (YYYY-MM-DD): ")
-    to_date = input("Enter TO date (YYYY-MM-DD): ")
-    duration = int(input("Enter meeting duration (minutes): "))
-
-    slots = suggest_meeting_slots(from_date, to_date, duration)
-
-    print("\nSuggested meeting slots:\n")
-    for s in slots:
-        print("•", s)
+    run_scheduler()
